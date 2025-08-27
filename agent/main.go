@@ -1,66 +1,190 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/grandcat/zeroconf"
 )
 
-// We need an Upgrader
-// This will upgrade a standard HTTP connection to a WebSocket connection.
+// Client represents a single connected peer (either a browser UI or another agent).
+type Client struct {
+	conn *websocket.Conn
+	// A buffered channel of outbound messages.
+	send chan []byte
+}
+
+// Hub maintains the set of active clients and broadcasts messages to them.
+type Hub struct {
+	clients    map[*Client]bool
+	broadcast  chan []byte
+	register   chan *Client
+	unregister chan *Client
+}
+
+func newHub() *Hub {
+	return &Hub{
+		clients:    make(map[*Client]bool),
+		broadcast:  make(chan []byte),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+	}
+}
+
+// run is the core of the Hub. It's a long-running function that listens for events.
+func (h *Hub) run() {
+	for {
+		select {
+		// A new client has connected.
+		case client := <-h.register:
+			h.clients[client] = true
+			log.Printf("Client registered. Total clients: %d", len(h.clients))
+
+		// A client has disconnected.
+		case client := <-h.unregister:
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+				log.Printf("Client unregistered. Total clients: %d", len(h.clients))
+			}
+
+		// A message needs to be broadcast to all clients.
+		case message := <-h.broadcast:
+			for client := range h.clients {
+				// Send the message to the client's send channel.
+				// We use a select with a default to avoid blocking if the channel is full.
+				select {
+				case client.send <- message:
+				default:
+					close(client.send)
+					delete(h.clients, client)
+				}
+			}
+		}
+	}
+}
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	// We can add a CheckOrigin function here for security in production,
-	// but for now, we'll allow any connection.
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-// handleWebSocket handles the WebSocket connection.
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Upgrade the HTTP connection to a WebSocket connection.
+// serveWs handles websocket requests from the peer.
+func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Error upgrading to WebSocket:", err)
+		log.Println(err)
 		return
 	}
-	// Make sure we close the connection when the function returns.
-	defer conn.Close()
-	log.Println("Client connected via WebSocket...")
 
-	// This is our infinite loop for reading messages from the client.
+	client := &Client{conn: conn, send: make(chan []byte, 256)}
+	hub.register <- client
+
+	// Allow collection of memory referenced by the caller by doing all work in new goroutines.
+	go client.writePump()
+	go client.readPump(hub)
+}
+
+// readPump pumps messages from the websocket connection to the hub.
+func (c *Client) readPump(hub *Hub) {
+	defer func() {
+		hub.unregister <- c
+		c.conn.Close()
+	}()
 	for {
-		// Read message from browser
-		messageType, message, err := conn.ReadMessage()
+		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			log.Println("Client disconnected:", err)
-			break // Exit the loop if the client disconnects.
+			break
 		}
-
-		// Log the message to the agent's console.
-		log.Printf("Received: %s", message)
-
-		// Echo the message back to the browser.
-		if err := conn.WriteMessage(messageType, message); err != nil {
-			log.Println("Error writing message:", err)
-			break // Exit if we can't write a message.
-		}
+		// When a message is received, send it to the hub's broadcast channel.
+		hub.broadcast <- message
 	}
+}
+
+// writePump pumps messages from the hub to the websocket connection.
+func (c *Client) writePump() {
+	defer func() {
+		c.conn.Close()
+	}()
+	for {
+		message, ok := <-c.send
+		if !ok {
+			// The hub closed the channel.
+			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
+		}
+		c.conn.WriteMessage(websocket.TextMessage, message)
+	}
+}
+
+// startDiscovery uses mDNS (zeroconf) to find other peers on the network.
+func startDiscovery(hub *Hub, serviceName string, port int) {
+	// 1. Register our own service
+	host, _ := os.Hostname()
+	server, err := zeroconf.Register(
+		fmt.Sprintf("%s-%s", "CollabText", host), // Unique instance name
+		serviceName, // Service type
+		"local.",    // Domain
+		port,        // Port
+		[]string{"txtv=0", "lo=1", "la=2"}, // TXT records
+		nil, // Network interfaces
+	)
+	if err != nil {
+		log.Fatalf("Failed to register mDNS service: %v", err)
+	}
+	defer server.Shutdown()
+	log.Printf("mDNS Service registered: %s on port %d", serviceName, port)
+
+	// 2. Discover other services
+	resolver, err := zeroconf.NewResolver(nil)
+	if err != nil {
+		log.Fatalf("Failed to initialize mDNS resolver: %v", err)
+	}
+
+	entries := make(chan *zeroconf.ServiceEntry)
+	go func(results <-chan *zeroconf.ServiceEntry) {
+		for entry := range results {
+			log.Printf("mDNS Discovered peer: %s at %s:%d", entry.Instance, entry.AddrIPv4[0], entry.Port)
+			// Here you would connect to the peer. For now, we'll just log.
+			// In the next steps, we will add logic to establish a WebSocket connection to this peer.
+		}
+	}(entries)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+	defer cancel()
+	err = resolver.Browse(ctx, serviceName, "local.", entries)
+	if err != nil {
+		log.Fatalf("Failed to browse for mDNS services: %v", err)
+	}
+	<-ctx.Done()
+	log.Println("mDNS browsing finished.")
 }
 
 func main() {
-	// The file server is the same as before.
+	hub := newHub()
+	// Start the hub in a separate goroutine.
+	go hub.run()
+
+	// Start mDNS discovery in a separate goroutine.
+	go startDiscovery(hub, "_collabtext._tcp", 8080)
+
+	// Serve the UI files.
 	fs := http.FileServer(http.Dir("../ui"))
 	http.Handle("/", fs)
 
-	// We add a NEW handler for our WebSocket endpoint.
-	// All requests to "/ws" will now be handled by handleWebSocket.
-	http.HandleFunc("/ws", handleWebSocket)
+	// Handle WebSocket connections.
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		serveWs(hub, w, r)
+	})
 
-	log.Println("CollabText agent is running. Visit http://localhost:8080 in your browser.")
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
+	log.Println("CollabText agent is running on port 8080...")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
