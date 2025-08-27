@@ -14,32 +14,76 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/grandcat/zeroconf"
+	"go.etcd.io/bbolt"
 )
 
-// --- CRDT Document State ---
+// --- Global State ---
 var document []Char
 var peerID string
 var clock int
+var db *bbolt.DB
 
-// init runs once when the application starts.
-func init() {
-	peerID = uuid.New().String()
-	log.Printf("Initialized Peer with ID: %s", peerID)
-	document = []Char{
-		{ID: CharID{Clock: 0, PeerID: "start"}, Position: []int{0}},
-		{ID: CharID{Clock: 0, PeerID: "end"}, Position: []int{10000}},
+const dbFile = "collabtext.db"
+const docBucket = "documents"
+const defaultDocKey = "default_doc"
+
+// --- Database Functions ---
+
+func loadDocument() {
+	err := db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(docBucket))
+		if bucket == nil {
+			return nil
+		}
+		docBytes := bucket.Get([]byte(defaultDocKey))
+		if docBytes == nil {
+			return nil
+		}
+		return json.Unmarshal(docBytes, &document)
+	})
+	if err != nil {
+		log.Fatalf("Failed to load document: %v", err)
+	}
+
+	if len(document) == 0 {
+		document = []Char{
+			{ID: CharID{Clock: 0, PeerID: "start"}, Position: []int{0}},
+			{ID: CharID{Clock: 0, PeerID: "end"}, Position: []int{10000}},
+		}
+		log.Println("Initialized a new empty document.")
+	} else {
+		log.Println("Document loaded successfully from database.")
 	}
 }
 
-// handleIncomingOp processes ops from clients and generates a broadcast-able CRDT op.
+func saveDocument() {
+	err := db.Update(func(tx *bbolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(docBucket))
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
+		}
+		docBytes, err := json.Marshal(document)
+		if err != nil {
+			return fmt.Errorf("marshal document: %s", err)
+		}
+		return bucket.Put([]byte(defaultDocKey), docBytes)
+	})
+	if err != nil {
+		log.Printf("Error saving document: %v", err)
+	}
+}
+
+// --- CRDT and Op Handling ---
+
 func handleIncomingOp(op Op) []byte {
 	clock++
 	var crdtOp Op
+	modified := false
 
 	switch op.Action {
 	case "raw_insert":
 		charToInsert := op.Char.Value
-		index := op.Index + 1 // Client index is offset by 1 due to our "start" boundary marker
+		index := op.Index + 1
 		if index < 1 { index = 1 }
 		if index > len(document)-1 { index = len(document) - 1 }
 		posPrev := document[index-1].Position
@@ -48,12 +92,22 @@ func handleIncomingOp(op Op) []byte {
 		newChar := Char{ID: CharID{Clock: clock, PeerID: peerID}, Value: charToInsert, Position: newPos}
 		crdtOp = Op{Action: "crdt_insert", Char: newChar, ClientID: op.ClientID}
 		applyCrdtInsert(crdtOp)
+		modified = true
 	case "raw_delete":
-		index := op.Index + 1 // Client index is offset by 1
+		index := op.Index + 1
 		if index < 1 || index >= len(document)-1 { return nil }
 		charToDelete := document[index]
 		crdtOp = Op{Action: "crdt_delete", Char: charToDelete, ClientID: op.ClientID}
 		applyCrdtDelete(crdtOp)
+		modified = true
+	}
+
+	if modified {
+		saveDocument()
+	}
+
+	if crdtOp.Action == "" {
+		return nil
 	}
 
 	opBytes, err := json.Marshal(crdtOp)
@@ -119,54 +173,71 @@ func newHub() *Hub { return &Hub{broadcast: make(chan []byte), register: make(ch
 func (h *Hub) run() { for { select { case client := <-h.register: h.clients[client] = true; case client := <-h.unregister: if _, ok := h.clients[client]; ok { delete(h.clients, client); close(client.send); }; case message := <-h.broadcast: for client := range h.clients { select { case client.send <- message: default: close(client.send); delete(h.clients, client) } } } } }
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) { conn, err := upgrader.Upgrade(w, r, nil); if err != nil { return }; client := &Client{conn: conn, send: make(chan []byte, 256)}; hub.register <- client; go client.writePump(); go client.readPump(hub) }
-
-func (c *Client) readPump(hub *Hub) {
-	defer func() { hub.unregister <- c; c.conn.Close() }()
-	for {
-		_, message, err := c.conn.ReadMessage()
-		if err != nil { break }
-		var op Op
-		if err := json.Unmarshal(message, &op); err != nil { log.Printf("Error decoding op: %v", err); continue }
-		broadcastMsg := handleIncomingOp(op)
-		if broadcastMsg != nil { hub.broadcast <- broadcastMsg }
-	}
-}
-
+func (c *Client) readPump(hub *Hub) { defer func() { hub.unregister <- c; c.conn.Close() }(); for { _, message, err := c.conn.ReadMessage(); if err != nil { break }; var op Op; if err := json.Unmarshal(message, &op); err != nil { log.Printf("Error decoding op: %v", err); continue }; broadcastMsg := handleIncomingOp(op); if broadcastMsg != nil { hub.broadcast <- broadcastMsg } } }
 func (c *Client) writePump() { defer c.conn.Close(); for { message, ok := <-c.send; if !ok { c.conn.WriteMessage(websocket.CloseMessage, []byte{}); return }; c.conn.WriteMessage(websocket.TextMessage, message) } }
 
 // --- mDNS Discovery ---
 func startDiscovery(hub *Hub, serviceName string, port int) {
 	host, _ := os.Hostname()
-	server, err := zeroconf.Register(fmt.Sprintf("%s-%s", "CollabText", host), serviceName, "local.", port, []string{"txtv=0"}, nil)
-	if err != nil { log.Fatalf("Failed to register mDNS: %v", err) }
+	server, err := zeroconf.Register(
+		fmt.Sprintf("%s-%s", "CollabText", host),
+		serviceName,
+		"local.",
+		port,
+		[]string{"txtv=0"},
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to register mDNS: %v", err)
+	}
 	defer server.Shutdown()
 	log.Printf("mDNS Service registered: %s on port %d", serviceName, port)
+
 	resolver, err := zeroconf.NewResolver(nil)
-	if err != nil { log.Fatalf("Failed to init resolver: %v", err) }
+	if err != nil {
+		log.Fatalf("Failed to init resolver: %v", err)
+	}
+
 	entries := make(chan *zeroconf.ServiceEntry)
 	go func(results <-chan *zeroconf.ServiceEntry) {
 		for entry := range results {
 			log.Printf("mDNS Discovered peer: %s at %s:%d", entry.Instance, entry.AddrIPv4[0], entry.Port)
 		}
 	}(entries)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	err = resolver.Browse(ctx, serviceName, "local.", entries)
-	if err != nil { log.Fatalf("Failed to browse mDNS: %v", err) }
+	if err != nil {
+		log.Fatalf("Failed to browse mDNS: %v", err)
+	}
 	<-ctx.Done()
 	log.Println("mDNS initial browsing finished.")
 }
 
 // --- Main Function ---
 func main() {
+	var err error
+	peerID = uuid.New().String()
+
+	db, err = bbolt.Open(dbFile, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	loadDocument()
+
 	hub := newHub()
 	go hub.run()
 	go startDiscovery(hub, "_collabtext._tcp", 8080)
+
 	fs := http.FileServer(http.Dir("../ui"))
 	http.Handle("/", fs)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(hub, w, r)
 	})
+
 	log.Println("CollabText agent is running on port 8080...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
