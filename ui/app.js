@@ -1,7 +1,12 @@
 window.addEventListener('DOMContentLoaded', (event) => {
     const editor = document.getElementById('editor');
-    const status = document.getElementById('status'); // Get the status element
-    let lastText = ''; // Keep track of the last known text
+    const status = document.getElementById('status');
+    
+    // --- NEW: Generate a unique ID for this client session ---
+    const clientID = 'client-' + Math.random().toString(36).substr(2, 9);
+    console.log('My Client ID:', clientID);
+
+    let lastText = '';
 
     const socket = new WebSocket('ws://localhost:8080/ws');
 
@@ -13,7 +18,13 @@ window.addEventListener('DOMContentLoaded', (event) => {
 
     socket.onmessage = (event) => {
         const op = JSON.parse(event.data);
-        console.log('Received Op:', op);
+        
+        // --- FIX: Ignore operations that we sent ---
+        if (op.clientID === clientID) {
+            return; // This is an echo of our own change, so do nothing.
+        }
+
+        console.log('Received Op from peer:', op);
         applyOperation(op);
     };
     
@@ -34,6 +45,8 @@ window.addEventListener('DOMContentLoaded', (event) => {
         const op = diff(lastText, currentText);
         
         if (op && socket.readyState === WebSocket.OPEN) {
+            // --- NEW: Add our clientID to the operation ---
+            op.clientID = clientID;
             socket.send(JSON.stringify(op));
         }
 
