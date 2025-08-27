@@ -4,6 +4,7 @@ go 1.24.5
 
 require (
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/grandcat/zeroconf v1.0.0 // indirect
 	github.com/miekg/dns v1.1.27 // indirect
