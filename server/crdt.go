@@ -13,8 +13,6 @@ type Char struct {
 
 type Op struct {
 	Action   string `json:"action"`
-	Char     Char   `json:"char,omitempty"`
-	Index    int    `json:"index,omitempty"`
+	Char     Char   `json:"char"`
 	ClientID string `json:"clientID"`
-	Doc      []Char `json:"doc,omitempty"`
 }

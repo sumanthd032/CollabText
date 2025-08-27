@@ -1,142 +1,87 @@
 window.addEventListener('DOMContentLoaded', () => {
     const editor = document.getElementById('editor');
-    const status = document.getElementById('status');
-    const clientID = 'client-' + Math.random().toString(36).substr(2, 9);
-    console.log('My Client ID:', clientID);
+    const statusEl = document.getElementById('status');
+    const userListEl = document.getElementById('user-list');
+    const usernameInput = document.getElementById('username');
+    const docTitleEl = document.getElementById('doc-title');
 
-    // The client's source of truth for the document.
     let localDoc = [];
+    const clientID = 'client-' + Math.random().toString(36).substr(2, 9);
+    let username = 'User-' + clientID.substr(0, 4);
+    usernameInput.value = username;
 
-    const socket = new WebSocket('ws://localhost:8080/ws');
+    const defaultDocID = "123e4567-e89b-12d3-a456-426614174000";
+    let docID = window.location.hash.substring(1);
+    function isValidUUID(uuid) { return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(uuid); }
+    if (!isValidUUID(docID)) { docID = defaultDocID; window.location.hash = docID; }
+    docTitleEl.textContent = `Document: ${docID}`;
 
+    const socket = new WebSocket('ws://' + window.location.host.split(':')[0] + ':8080/ws');
     socket.onopen = () => {
-        status.textContent = 'Connected';
-        status.className = 'font-mono text-green-400';
+        statusEl.textContent = 'Connected to Agent'; statusEl.className = 'font-mono text-green-400';
+        socket.send(JSON.stringify({ action: 'join', docID: docID }));
+        setInterval(sendPresence, 5000); sendPresence();
     };
 
     socket.onmessage = (event) => {
-        const op = JSON.parse(event.data);
-        
-        // FIX #1: The simplest way to handle echoes is to ignore ops from ourselves.
-        // The server will be the source of truth, even for our own changes.
-        if (op.clientID === clientID) {
-            return; 
+        const data = JSON.parse(event.data);
+        if (data.action === 'load') {
+            localDoc = data.doc;
+            render(editor.selectionStart);
+            socket.send(JSON.stringify({action: "save_snapshot", doc: localDoc}));
+        } else if (data.action === 'presence_update') {
+            updateUserList(data.users);
+        } else if (data.action === 'crdt_insert' || data.action === 'crdt_delete') {
+            if (data.clientID === clientID) return;
+            applyOperation(data);
         }
-
-        console.log('Received remote Op:', op);
-        applyOperation(op);
     };
 
-    socket.onclose = () => { status.textContent = 'Disconnected'; status.className = 'font-mono text-red-400'; };
-    socket.onerror = () => { status.textContent = 'Error'; status.className = 'font-mono text-red-400'; };
+    usernameInput.addEventListener('change', () => { username = usernameInput.value.trim() || 'User-' + clientID.substr(0, 4); sendPresence(); });
+    function sendPresence() { if (socket.readyState === WebSocket.OPEN) { socket.send(JSON.stringify({ action: 'presence', clientID, username })); } }
+    function updateUserList(users) { userListEl.innerHTML = ''; if(!users) return; for (const [id, name] of Object.entries(users)) { const li = document.createElement('li'); li.textContent = name; li.className = `text-slate-400 ${id === clientID ? 'font-bold text-cyan-300' : ''}`; userListEl.appendChild(li); } }
 
     editor.addEventListener('input', (e) => {
         const editorText = editor.value;
         const modelText = localDoc.map(c => c.value).join('');
-
         let i = 0;
-        while (i < editorText.length && i < modelText.length && editorText[i] === modelText[i]) {
-            i++;
-        }
-
-        // Deletion
+        while (i < editorText.length && i < modelText.length && editorText[i] === modelText[i]) { i++; }
         if (modelText.length > editorText.length) {
-            const rawOp = { action: 'raw_delete', clientID, index: i };
-            socket.send(JSON.stringify(rawOp));
-            // Apply change locally for responsiveness
-            localDoc.splice(i, modelText.length - editorText.length);
-        }
-        // Insertion
-        else if (editorText.length > modelText.length) {
-            const insertedText = editorText.slice(i, i + editorText.length - modelText.length);
-            // Send each character as a separate operation
-            insertedText.split('').forEach((char, offset) => {
-                const rawOp = { action: 'raw_insert', clientID, char: { value: char }, index: i + offset };
-                socket.send(JSON.stringify(rawOp));
+            for (let j = 0; j < modelText.length - editorText.length; j++) {
+                socket.send(JSON.stringify({ action: 'raw_delete', clientID, index: i }));
+            }
+        } else if (editorText.length > modelText.length) {
+            const inserted = editorText.slice(i, i + editorText.length - modelText.length);
+            inserted.split('').forEach((char, offset) => {
+                socket.send(JSON.stringify({ action: 'raw_insert', clientID, char: { value: char }, index: i + offset }));
             });
-            // Apply change locally for responsiveness
-            const newChars = insertedText.split('').map(c => ({ value: c }));
-            localDoc.splice(i, 0, ...newChars);
         }
+        localDoc = editorText.split('').map(c => ({value: c})); // Simple model update
     });
 
     function applyOperation(op) {
-        // FIX #2: Smarter cursor management
-        const preChangeCursor = editor.selectionStart;
-        const textBeforeCursor = editor.value.substring(0, preChangeCursor);
-        let charsBeforeCursor = 0;
-        for (let char of localDoc) {
-            if (textBeforeCursor.includes(char.value)) {
-                charsBeforeCursor++;
-            }
-        }
-
-        // FIX #1 (continued): Make the operation idempotent on the client
-        const alreadyExists = localDoc.some(char => 
-            char.id && op.char.id && 
-            char.id.peerID === op.char.id.peerID && 
-            char.id.clock === op.char.id.clock
-        );
-
+        const alreadyExists = op.action === 'crdt_insert' && localDoc.some(c => c.id && c.id.peerID === op.char.id.peerID && c.id.clock === op.char.id.clock);
+        if (alreadyExists) return;
+        const cursorPos = editor.selectionStart;
         if (op.action === 'crdt_insert') {
-            if (alreadyExists) return; // Don't apply the same op twice
             const index = findInsertIndex(op.char);
             localDoc.splice(index, 0, op.char);
         } else if (op.action === 'crdt_delete') {
-            localDoc = localDoc.filter(char =>
-                !(char.id.peerID === op.char.id.peerID && char.id.clock === op.char.id.clock)
-            );
+            localDoc = localDoc.filter(c => !(c.id.peerID === op.char.id.peerID && c.id.clock === op.char.id.clock));
         }
-
-        render(preChangeCursor);
+        render(cursorPos);
     }
     
-    function render(originalCursorPos) {
-        const text = localDoc.map(char => char.value).join('');
-        
-        // FIX #2 (continued): Calculate new cursor position
-        let newCursorPos = originalCursorPos;
-        const oldText = editor.value;
-        if (text.length < oldText.length) { // Deletion
-            // This is a simple approximation, more complex logic is needed for perfect cursor on remote delete
-        } else if (text.length > oldText.length) { // Insertion
-            // Find what was inserted before our original cursor position to adjust it
-            let diffIndex = 0;
-            while(diffIndex < oldText.length && oldText[diffIndex] === text[diffIndex]) {
-                diffIndex++;
-            }
-            if (diffIndex < originalCursorPos) {
-                newCursorPos += text.length - oldText.length;
-            }
-        }
-        
-        editor.value = text;
+    function render(cursorPos) {
+        const text = localDoc.map(c => c.value).join('');
         if (document.activeElement === editor) {
-            editor.setSelectionRange(newCursorPos, newCursorPos);
+            editor.value = text;
+            editor.setSelectionRange(cursorPos, cursorPos);
+        } else {
+            editor.value = text;
         }
     }
 
-    // Helper for CRDT model operations (unchanged)
-    function findInsertIndex(char) {
-        let low = 0, high = localDoc.length;
-        while (low < high) {
-            const mid = Math.floor((low + high) / 2);
-            if (localDoc[mid].provisional || comparePositions(localDoc[mid].position, char.position) > 0) {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-        return low;
-    }
-    
-    function comparePositions(pos1, pos2) {
-        for (let i = 0; i < pos1.length && i < pos2.length; i++) {
-            if (pos1[i] < pos2[i]) return -1;
-            if (pos1[i] > pos2[i]) return 1;
-        }
-        if (pos1.length < pos2.length) return -1;
-        if (pos1.length > pos2.length) return 1;
-        return 0;
-    }
+    function findInsertIndex(char) { let low = 0, high = localDoc.length; while (low < high) { const mid = Math.floor((low + high) / 2); if (!localDoc[mid].position || comparePositions(localDoc[mid].position, char.position) > 0) { high = mid; } else { low = mid + 1; } } return low; }
+    function comparePositions(p1, p2) { for (let i = 0; i < p1.length && i < p2.length; i++) { if (p1[i] < p2[i]) return -1; if (p1[i] > p2[i]) return 1; } if (p1.length < p2.length) return -1; if (p1.length > p2.length) return 1; return 0; }
 });
